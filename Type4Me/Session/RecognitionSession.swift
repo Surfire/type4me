@@ -10,6 +10,14 @@ private final class UploadFailureFlag: Sendable {
     }
 }
 
+private enum WhisperFallbackSettings {
+    static let enabledKey = "tf_whisperFallbackEnabled"
+    static let rmsThresholdKey = "tf_whisperFallbackRMSThreshold"
+    static let minDuration: TimeInterval = 0.8
+    static let defaultRMSThreshold = 0.012
+    static let pcmBytesPerSecond = 16000 * 2
+}
+
 actor RecognitionSession {
 
     // MARK: - State
@@ -579,83 +587,129 @@ actor RecognitionSession {
             }
             eventConsumptionTask?.cancel()
             eventConsumptionTask = nil
-            onASREvent?(.processingResult(text: ""))
-            onASREvent?(.completed)
-            if sessionGeneration == myGeneration, state != .idle {
-                state = .idle
-                hasEmittedReadyForCurrentSession = false
-                currentTranscript = .empty
-                warmUpASRConnection()
+            let fullAudio = audioEngine.getRecordedAudio()
+            if let fallbackText = await attemptWhisperFallbackIfNeeded(
+                audio: fullAudio,
+                localText: "",
+                reason: "no-speech"
+            ) {
+                currentTranscript = RecognitionTranscript(
+                    confirmedSegments: [fallbackText],
+                    partialText: "",
+                    authoritativeText: fallbackText,
+                    isFinal: true
+                )
+                onASREvent?(.processingResult(text: fallbackText))
+                DebugFileLogger.log("stop: whisper fallback recovered no-speech session (\(fallbackText.count) chars)")
+            } else {
+                onASREvent?(.processingResult(text: ""))
+                onASREvent?(.completed)
+                if sessionGeneration == myGeneration, state != .idle {
+                    state = .idle
+                    hasEmittedReadyForCurrentSession = false
+                    currentTranscript = .empty
+                    warmUpASRConnection()
+                }
+                resetSpeculativeLLM()
+                SystemVolumeManager.restore()
+                return
             }
-            resetSpeculativeLLM()
-            SystemVolumeManager.restore()
-            return
         }
 
-        // Two-phase wait: for streaming providers with short recordings and no
-        // streaming text yet, wait briefly for ASR to respond before deciding to skip.
-        // Phase 1: wait up to 1s for any streaming partial text.
-        // Phase 2: if text arrives, endAudio + wait up to 1s for final result.
+        if !currentTranscript.displayText.isEmpty, asrClient == nil, eventConsumptionTask == nil {
+            // A low-volume online fallback already produced the final transcript.
+            // Continue into LLM/post-processing without running the normal ASR teardown.
+        } else {
+            // Continue with the normal ASR teardown path below.
+        }
+
+        if !speechDetected, !currentTranscript.displayText.isEmpty {
+            // The no-speech branch recovered text via whisper fallback, so skip the
+            // short-recording fast-exit checks that assume local ASR is still active.
+        } else {
+            // Two-phase wait: for streaming providers with short recordings and no
+            // streaming text yet, wait briefly for ASR to respond before deciding to skip.
+            // Phase 1: wait up to 1s for any streaming partial text.
+            // Phase 2: if text arrives, endAudio + wait up to 1s for final result.
+            let provider = activeProvider
+            let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
+            if providerIsStreaming {
+                let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
+                let hasStreamingText = !currentTranscript.composedText
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                if duration < 5 && !hasStreamingText {
+                    // Phase 1: wait up to 1s for any streaming text
+                    DebugFileLogger.log("stop: short recording (\(String(format: "%.1f", duration))s) with no streaming text, waiting for partial")
+                    let gotText = await awaitFirstStreamingText(timeout: .seconds(1))
+
+                    if !gotText {
+                        // No streaming text after 1s — likely not real speech, fast exit
+                        DebugFileLogger.log("stop: no streaming text after 1s wait, fast exit")
+                        if let client = asrClient {
+                            await client.disconnect()
+                            self.asrClient = nil
+                        }
+                        eventConsumptionTask?.cancel()
+                        eventConsumptionTask = nil
+                        let fullAudio = audioEngine.getRecordedAudio()
+                        if let fallbackText = await attemptWhisperFallbackIfNeeded(
+                            audio: fullAudio,
+                            localText: "",
+                            reason: "short-no-streaming-text"
+                        ) {
+                            currentTranscript = RecognitionTranscript(
+                                confirmedSegments: [fallbackText],
+                                partialText: "",
+                                authoritativeText: fallbackText,
+                                isFinal: true
+                            )
+                            onASREvent?(.processingResult(text: fallbackText))
+                            DebugFileLogger.log("stop: whisper fallback recovered short silent session (\(fallbackText.count) chars)")
+                        } else {
+                            onASREvent?(.processingResult(text: ""))
+                            onASREvent?(.completed)
+                            if sessionGeneration == myGeneration, state != .idle {
+                                state = .idle
+                                hasEmittedReadyForCurrentSession = false
+                                currentTranscript = .empty
+                                warmUpASRConnection()
+                            }
+                            resetSpeculativeLLM()
+                            SystemVolumeManager.restore()
+                            return
+                        }
+                    } else {
+                        // Phase 2: streaming text arrived — endAudio + short wait for final
+                        DebugFileLogger.log("stop: streaming text arrived, phase 2 teardown +\(ContinuousClock.now - stopT0)")
+                        if let client = asrClient {
+                            _ = await withTimeout(.seconds(3)) {
+                                try await client.endAudio()
+                            }
+                            let finalResult = await awaitFinalTranscript(timeout: .seconds(1))
+                            DebugFileLogger.log("stop: phase 2 done, hasFinal=\(finalResult != nil) +\(ContinuousClock.now - stopT0)")
+
+                            // Drain events + disconnect in background so post-teardown can start
+                            let evtTask = eventConsumptionTask
+                            eventConsumptionTask = nil
+                            asrCleanupTask?.cancel()
+                            asrCleanupGeneration = myGeneration
+                            asrCleanupTask = Task { [weak self, myGeneration] in
+                                if let evtTask { _ = await self?.withTimeout(.seconds(3)) { await evtTask.value } }
+                                guard !Task.isCancelled else { return }
+                                await client.disconnect()
+                                DebugFileLogger.log("stop: phase 2 background cleanup done")
+                                await self?.clearASRCleanupTask(generation: myGeneration)
+                            }
+                            self.asrClient = nil
+                        }
+                        // Fall through to post-teardown (LLM, inject, etc.)
+                        // asrClient is nil → the normal teardown block below is skipped.
+                    }
+                }
+            }
+        }
         let provider = activeProvider
         let providerIsStreaming = ASRProviderRegistry.capabilities(for: provider).isStreaming
-        if providerIsStreaming {
-            let duration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
-            let hasStreamingText = !currentTranscript.composedText
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if duration < 5 && !hasStreamingText {
-                // Phase 1: wait up to 1s for any streaming text
-                DebugFileLogger.log("stop: short recording (\(String(format: "%.1f", duration))s) with no streaming text, waiting for partial")
-                let gotText = await awaitFirstStreamingText(timeout: .seconds(1))
-
-                if !gotText {
-                    // No streaming text after 1s — likely not real speech, fast exit
-                    DebugFileLogger.log("stop: no streaming text after 1s wait, fast exit")
-                    if let client = asrClient {
-                        await client.disconnect()
-                        self.asrClient = nil
-                    }
-                    eventConsumptionTask?.cancel()
-                    eventConsumptionTask = nil
-                    onASREvent?(.processingResult(text: ""))
-                    onASREvent?(.completed)
-                    if sessionGeneration == myGeneration, state != .idle {
-                        state = .idle
-                        hasEmittedReadyForCurrentSession = false
-                        currentTranscript = .empty
-                        warmUpASRConnection()
-                    }
-                    resetSpeculativeLLM()
-                    SystemVolumeManager.restore()
-                    return
-                }
-
-                // Phase 2: streaming text arrived — endAudio + short wait for final
-                DebugFileLogger.log("stop: streaming text arrived, phase 2 teardown +\(ContinuousClock.now - stopT0)")
-                if let client = asrClient {
-                    _ = await withTimeout(.seconds(3)) {
-                        try await client.endAudio()
-                    }
-                    let finalResult = await awaitFinalTranscript(timeout: .seconds(1))
-                    DebugFileLogger.log("stop: phase 2 done, hasFinal=\(finalResult != nil) +\(ContinuousClock.now - stopT0)")
-
-                    // Drain events + disconnect in background so post-teardown can start
-                    let evtTask = eventConsumptionTask
-                    eventConsumptionTask = nil
-                    asrCleanupTask?.cancel()
-                    asrCleanupGeneration = myGeneration
-                    asrCleanupTask = Task { [weak self, myGeneration] in
-                        if let evtTask { _ = await self?.withTimeout(.seconds(3)) { await evtTask.value } }
-                        guard !Task.isCancelled else { return }
-                        await client.disconnect()
-                        DebugFileLogger.log("stop: phase 2 background cleanup done")
-                        await self?.clearASRCleanupTask(generation: myGeneration)
-                    }
-                    self.asrClient = nil
-                }
-                // Fall through to post-teardown (LLM, inject, etc.)
-                // asrClient is nil → the normal teardown block below is skipped.
-            }
-        }
 
         // Keep speculative LLM task alive — we'll compare its input text
         // against the final ASR transcript after full teardown.
@@ -822,6 +876,24 @@ actor RecognitionSession {
                 } else {
                     DebugFileLogger.log("stop: batch fallback failed, using partial text")
                 }
+            }
+        }
+        if !needsBatchFallback {
+            let localText = currentTranscript.displayText
+            let fullAudio = audioEngine.getRecordedAudio()
+            if let fallbackText = await attemptWhisperFallbackIfNeeded(
+                audio: fullAudio,
+                localText: localText,
+                reason: "low-volume-or-poor-local-result"
+            ) {
+                currentTranscript = RecognitionTranscript(
+                    confirmedSegments: [fallbackText],
+                    partialText: "",
+                    authoritativeText: fallbackText,
+                    isFinal: true
+                )
+                onASREvent?(.processingResult(text: fallbackText))
+                DebugFileLogger.log("stop: whisper fallback replaced local result (\(localText.count) -> \(fallbackText.count) chars)")
             }
         }
         uploadFailureFlag = nil
@@ -1401,6 +1473,151 @@ actor RecognitionSession {
     }
 
     // MARK: - Batch Fallback
+
+    private func attemptWhisperFallbackIfNeeded(audio: Data, localText: String, reason: String) async -> String? {
+        let enabled = UserDefaults.standard.object(forKey: WhisperFallbackSettings.enabledKey) as? Bool ?? false
+        guard enabled else { return nil }
+        guard activeProvider != .volcano else { return nil }
+        guard let volcanoConfig = KeychainService.loadASRConfig(for: .volcano) as? VolcanoASRConfig else {
+            DebugFileLogger.log("whisper fallback skipped: volcano config missing")
+            return nil
+        }
+
+        let duration = pcmDuration(audio)
+        guard duration >= WhisperFallbackSettings.minDuration else { return nil }
+
+        let rms = pcmRMS(audio)
+        let threshold = UserDefaults.standard.object(forKey: WhisperFallbackSettings.rmsThresholdKey) as? Double
+            ?? WhisperFallbackSettings.defaultRMSThreshold
+        let trimmed = localText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowVolume = rms > 0 && rms <= threshold
+        let poorLocalResult = trimmed.isEmpty
+            || trimmed.count <= 2
+            || (duration >= 2.0 && trimmed.count < 4)
+        guard lowVolume || poorLocalResult else { return nil }
+
+        DebugFileLogger.log(
+            "whisper fallback triggered reason=\(reason) duration=\(String(format: "%.1f", duration))s rms=\(String(format: "%.4f", rms)) threshold=\(String(format: "%.4f", threshold)) local=\(trimmed.count)chars"
+        )
+        onASREvent?(.processingLabelOverride(L("低声增强中", "Enhancing whisper")))
+        let result = await transcribeWithVolcano(audio: audio, config: volcanoConfig)
+        guard let text = result?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            DebugFileLogger.log("whisper fallback failed or empty")
+            return nil
+        }
+
+        if trimmed.isEmpty || text.count >= max(3, trimmed.count) {
+            DebugFileLogger.log("whisper fallback accepted \(text.count) chars")
+            return text
+        }
+
+        DebugFileLogger.log("whisper fallback rejected: fallback shorter than local (\(text.count) < \(trimmed.count))")
+        return nil
+    }
+
+    private func pcmDuration(_ audio: Data) -> TimeInterval {
+        TimeInterval(audio.count) / TimeInterval(WhisperFallbackSettings.pcmBytesPerSecond)
+    }
+
+    private func pcmRMS(_ audio: Data) -> Double {
+        guard audio.count >= 2 else { return 0 }
+        var sumSquares = 0.0
+        var sampleCount = 0
+        audio.withUnsafeBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            var i = 0
+            while i + 1 < bytes.count {
+                let lo = UInt16(bytes[i])
+                let hi = UInt16(bytes[i + 1]) << 8
+                let sample = Int16(bitPattern: hi | lo)
+                let normalized = Double(sample) / 32768.0
+                sumSquares += normalized * normalized
+                sampleCount += 1
+                i += 2
+            }
+        }
+        guard sampleCount > 0 else { return 0 }
+        return sqrt(sumSquares / Double(sampleCount))
+    }
+
+    private func transcribeWithVolcano(audio: Data, config: VolcanoASRConfig) async -> String? {
+        let resultTask = Task.detached { () -> String? in
+            let client = VolcASRClient()
+            do {
+                let options = ASRRequestOptions(
+                    enablePunc: true,
+                    hotwords: HotwordStorage.loadEffective(),
+                    bypassProxy: ProxyBypassMode.current.bypassASR
+                )
+                try await client.connect(config: config, options: options)
+
+                let chunkSize = 6400
+                var offset = 0
+                while offset < audio.count {
+                    guard !Task.isCancelled else {
+                        await client.disconnect()
+                        return nil
+                    }
+                    let end = min(offset + chunkSize, audio.count)
+                    try await client.sendAudio(audio.subdata(in: offset..<end))
+                    offset = end
+                }
+                try await client.endAudio()
+
+                var bestText = ""
+                let events = await client.events
+                for await event in events {
+                    switch event {
+                    case .transcript(let transcript):
+                        let text = transcript.authoritativeText.isEmpty
+                            ? transcript.composedText
+                            : transcript.authoritativeText
+                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            bestText = trimmed
+                        }
+                        if transcript.isFinal || (!transcript.confirmedSegments.isEmpty && transcript.partialText.isEmpty) {
+                            await client.disconnect()
+                            return bestText.isEmpty ? nil : bestText
+                        }
+                    case .error(let error):
+                        DebugFileLogger.log("whisper fallback volcano error: \(error)")
+                        await client.disconnect()
+                        return nil
+                    case .completed:
+                        await client.disconnect()
+                        return bestText.isEmpty ? nil : bestText
+                    default:
+                        continue
+                    }
+                }
+                await client.disconnect()
+                return nil
+            } catch {
+                DebugFileLogger.log("whisper fallback volcano exception: \(error)")
+                await client.disconnect()
+                return nil
+            }
+        }
+
+        return await withCheckedContinuation { continuation in
+            let finished = OSAllocatedUnfairLock(initialState: false)
+            Task.detached {
+                let result = await resultTask.value
+                if finished.withLock({ let old = $0; $0 = true; return !old }) {
+                    continuation.resume(returning: result)
+                }
+            }
+            Task.detached {
+                try? await Task.sleep(for: .seconds(30))
+                if finished.withLock({ let old = $0; $0 = true; return !old }) {
+                    resultTask.cancel()
+                    DebugFileLogger.log("whisper fallback timeout after 30s")
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
 
     /// Try to transcribe full audio via the same provider.
     /// Soniox uses its async REST API (faster for complete audio); others use a fresh streaming connection.
